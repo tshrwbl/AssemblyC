@@ -27,7 +27,42 @@
 
 #ifdef _WIN32
 #include <windows.h>  /* QueryPerformanceCounter for high-res timing */
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 #endif
+
+typedef struct {
+    double working_set_mb;   /* Physical RAM currently in use */
+    double commit_mb;        /* Committed virtual memory (RAM + Pagefile) */
+    double avail_phys_mb;    /* Total system available physical RAM */
+} MemSnapshot;
+
+static MemSnapshot get_memory_snapshot(void) {
+    MemSnapshot snap = {0.0, 0.0, 0.0};
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+        snap.working_set_mb = (double)pmc.WorkingSetSize / (1024.0 * 1024.0);
+        snap.commit_mb = (double)pmc.PrivateUsage / (1024.0 * 1024.0);
+    }
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        snap.avail_phys_mb = (double)ms.ullAvailPhys / (1024.0 * 1024.0);
+    }
+#endif
+    return snap;
+}
+
+static void print_mem_snapshot(const char* label, MemSnapshot snap) {
+    if (snap.commit_mb >= 1024.0) {
+        printf("    %-18s: Commit: %6.2f GB | Resident RAM: %6.2f GB | Sys Avail: %6.2f GB\n",
+               label, snap.commit_mb / 1024.0, snap.working_set_mb / 1024.0, snap.avail_phys_mb / 1024.0);
+    } else {
+        printf("    %-18s: Commit: %6.2f MB | Resident RAM: %6.2f MB | Sys Avail: %6.2f GB\n",
+               label, snap.commit_mb, snap.working_set_mb, snap.avail_phys_mb / 1024.0);
+    }
+}
 
 /*==========================================================================
  * Assembly function declarations (defined in hot_path.asm)
@@ -333,47 +368,106 @@ int main(int argc, char* argv[]) {
         }
 
         /* 1. Run Pure C */
+        MemSnapshot mem_c_before = get_memory_snapshot();
         printf("[1/2] Running Pure C (MSVC /O2) ... ");
         fflush(stdout);
         double t0_c = get_time_ms();
         PermResult* res_c = permute_unique_c(working_c, n);
         double t1_c = get_time_ms();
         double c_ms = t1_c - t0_c;
+        int c_success = (res_c != NULL);
+        uint64_t c_count = res_c ? res_c->count : 0;
+        MemSnapshot mem_c_peak = get_memory_snapshot();
         if (!res_c) {
             printf("FAILED (Out of Memory)!\n");
         } else {
             printf("Done in %10.3f ms\n", c_ms);
         }
 
+        MemSnapshot mem_settled = mem_c_peak;
+        if (n > 11) {
+            /* Free C results before Assembly if n > 11 to avoid holding dual massive buffers in RAM */
+            if (res_c) {
+                result_free(res_c);
+                res_c = NULL;
+            }
+
+            /* 10-second cooldown for OS memory manager and page cache to settle */
+            printf("\n[Cooldown] Freeing C buffer & waiting 10s for OS memory manager to reclaim & settle pages...\n");
+            for (int sec = 10; sec > 0; sec--) {
+                printf("\r  Cooldown: %2d seconds remaining... ", sec);
+                fflush(stdout);
+#ifdef _WIN32
+                Sleep(1000);
+#endif
+            }
+            printf("\r  Cooldown complete. Memory settled.                           \n\n");
+            mem_settled = get_memory_snapshot();
+        }
+
         /* 2. Run x64 Assembly */
+        MemSnapshot mem_asm_before = get_memory_snapshot();
         printf("[2/2] Running x64 MASM (SSE2)   ... ");
         fflush(stdout);
         double t0_asm = get_time_ms();
         PermResult* res_asm = permute_unique_asm(working_asm, n);
         double t1_asm = get_time_ms();
         double asm_ms = t1_asm - t0_asm;
+        int asm_success = (res_asm != NULL);
+        uint64_t asm_count = res_asm ? res_asm->count : 0;
+        MemSnapshot mem_asm_peak = get_memory_snapshot();
         if (!res_asm) {
             printf("FAILED (Out of Memory)!\n");
         } else {
             printf("Done in %10.3f ms\n", asm_ms);
         }
 
+        if (n > 11 && res_asm) {
+            result_free(res_asm);
+            res_asm = NULL;
+        }
+        MemSnapshot mem_asm_after = get_memory_snapshot();
+
         printf("\n----------------------------------------------------------------------\n");
-        printf(" BENCHMARK COMPARISON:\n");
+        printf(" TIME & THROUGHPUT BENCHMARK COMPARISON:\n");
         printf("----------------------------------------------------------------------\n");
         printf("  Unique Permutations : %llu\n", (unsigned long long)expected_count);
         printf("  Pure C (/O2) Time   : %10.3f ms\n", c_ms);
         printf("  x64 Assembly Time   : %10.3f ms\n", asm_ms);
-        if (res_c && res_asm && asm_ms > 0.0001) {
+        if (c_success && asm_success && asm_ms > 0.0001) {
             double speedup = c_ms / asm_ms;
             printf("  Assembly Speedup    : %10.2fx %s\n", speedup,
                    (speedup >= 1.0) ? "FASTER than C" : "SLOWER than C");
         }
 
-        if (res_c && res_asm) {
+        if (n <= 11 && res_c && res_asm) {
             int match = verify_results(res_c, res_asm);
             printf("  Correctness Check   : %s\n", match ? "[OK - Exact 100% Match]" : "[FAILED - MISMATCH]");
+        } else if (n > 11) {
+            int count_match = (c_count == expected_count && asm_count == expected_count);
+            printf("  Count Verification  : %s (%llu generated)\n",
+                   count_match ? "[OK - Exact Count Match]" : "[FAILED - Count Mismatch]",
+                   (unsigned long long)asm_count);
+            printf("  Correctness Check   : [Skipped for n > 11 to avoid 43GB dual-buffer memory exhaustion]\n");
         }
+
+        printf("\n----------------------------------------------------------------------\n");
+        printf(" SPACE COMPLEXITY & MEMORY USAGE COMPARISON:\n");
+        printf("----------------------------------------------------------------------\n");
+        printf("  Theoretical Space Complexity:\n");
+        printf("    - Permutation Storage : O(n * n!) = %.2f %s (Flat contiguous buffer)\n",
+               (mem_mb >= 1024.0) ? (mem_mb / 1024.0) : mem_mb,
+               (mem_mb >= 1024.0) ? "GB" : "MB");
+        printf("    - Auxiliary Overhead  : O(1) in-place stack/registers for both C and ASM\n\n");
+        printf("  Pure C (MSVC /O2) Memory Snapshot:\n");
+        print_mem_snapshot("Before Run", mem_c_before);
+        print_mem_snapshot("Active/Peak Run", mem_c_peak);
+        print_mem_snapshot("After 10s Settle", mem_settled);
+        printf("\n");
+        printf("  x64 MASM (SSE2) Memory Snapshot:\n");
+        print_mem_snapshot("Before Run", mem_asm_before);
+        print_mem_snapshot("Active/Peak Run", mem_asm_peak);
+        print_mem_snapshot("After Run Free", mem_asm_after);
         printf("----------------------------------------------------------------------\n\n");
 
         if (res_asm && res_asm->count <= 50) {
